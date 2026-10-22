@@ -53,6 +53,17 @@
   var cache = {}; // tabela -> {rows:[], at:ms, maxId:n}
   function copy(rows) { return rows.map(function (r) { return Object.assign({}, r); }); }
 
+  // Datas sempre no horário de Brasília (mesmo formato que o api.php devolvia: sem fuso)
+  var BRT = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Sao_Paulo', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  function brt(row) {
+    if (row && row.criado_em) {
+      var d = new Date(row.criado_em);
+      if (!isNaN(d)) row.criado_em = BRT.format(d).replace(' ', 'T');
+    }
+    return row;
+  }
+
   async function fetchPages(table, cfg, sinceId) {
     var out = [], from = 0;
     for (;;) {
@@ -61,7 +72,7 @@
       q = q.order(cfg.order, { ascending: true }).range(from, from + PAGE - 1);
       var r = await q;
       if (r.error) throw Err(r.error.message || 'Erro ao consultar.', r.status || 500);
-      out = out.concat(r.data);
+      out = out.concat(r.data.map(brt));
       if (r.data.length < PAGE) break;
       from += PAGE;
     }
@@ -109,10 +120,39 @@
       r = await sb.from(table).upsert(row, { onConflict: cfg.key });
       delete cache[table];
     } else {
+      if (table === 'tickets') return insertTicketOnce(row);
       r = await sb.from(table).insert(row);
     }
     if (r.error) throw Err(r.error.message, 500);
     return { ok: true };
+  }
+
+  // Anti-duplicidade: o app pode mandar o mesmo ticket 2x em sequência.
+  // Junta pedidos iguais (tipo+resumo+texto) feitos em até 0,4 s e ignora repetidos por 20 s.
+  var pendT = {}, recentT = {};
+  function insertTicketOnce(row) {
+    var key = [row.tipo, row.resumo, row.texto].join('\u0001'), now = Date.now();
+    if (recentT[key] && now - recentT[key] < 20000) return Promise.resolve({ ok: true });
+    var p = pendT[key];
+    if (p) { // completa campos que faltavam no primeiro pedido
+      Object.keys(row).forEach(function (c) {
+        if (row[c] != null && row[c] !== '' && (p.row[c] == null || p.row[c] === '' || p.row[c] === '—')) p.row[c] = row[c];
+      });
+      return p.promise;
+    }
+    p = pendT[key] = { row: Object.assign({}, row) };
+    p.promise = new Promise(function (resolve, reject) {
+      setTimeout(async function () {
+        delete pendT[key];
+        try {
+          var r = await sb.from('tickets').insert(p.row);
+          if (r.error) return reject(Err(r.error.message, 500));
+          recentT[key] = Date.now();
+          resolve({ ok: true });
+        } catch (e) { reject(e); }
+      }, 400);
+    });
+    return p.promise;
   }
 
   async function admin(body) {
